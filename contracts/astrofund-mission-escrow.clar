@@ -182,6 +182,9 @@
       (mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID))
       (current-status (get status mission))
       (current-contribution (default-to u0 (map-get? funder-contributions { mission-id: mission-id, funder: tx-sender })))
+      (validated-mission-id mission-id)
+      (new-funds (+ (get current-funds-held mission) amount))
+      (new-contribution (+ current-contribution amount))
     )
     (asserts! (or (is-eq current-status STATUS-PROPOSED) (is-eq current-status STATUS-ACTIVE)) ERR-MISSION-NOT-ACTIVE)
     (asserts! (> amount u0) ERR-INVALID-INPUT)
@@ -191,18 +194,18 @@
 
     ;; Update mission status to Active if first funding
     (if (is-eq current-status STATUS-PROPOSED)
-      (map-set mission-data mission-id (merge mission { 
+      (map-set mission-data validated-mission-id (merge mission { 
         status: STATUS-ACTIVE,
-        current-funds-held: (+ (get current-funds-held mission) amount)
+        current-funds-held: new-funds
       }))
-      (map-set mission-data mission-id (merge mission { 
-        current-funds-held: (+ (get current-funds-held mission) amount)
+      (map-set mission-data validated-mission-id (merge mission { 
+        current-funds-held: new-funds
       }))
     )
     
     ;; Record funder contribution
-    (map-set funder-contributions { mission-id: mission-id, funder: tx-sender }
-      (+ current-contribution amount))
+    (map-set funder-contributions { mission-id: validated-mission-id, funder: tx-sender }
+      new-contribution)
     
     (ok true)
   ))
@@ -217,18 +220,21 @@
     (
       (new-milestone-id (var-get next-milestone-id))
       (mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID))
+      (validated-mission-id mission-id)
+      (validated-description description)
+      (validated-amount amount-to-release)
     )
-    (try! (assert-is-mission-proposer mission-id))
+    (try! (assert-is-mission-proposer validated-mission-id))
     (asserts! (not (is-eq (get status mission) STATUS-CANCELED)) ERR-MISSION-ALREADY-CANCELED)
-    (asserts! (> amount-to-release u0) ERR-INVALID-INPUT)
-    (asserts! (> (len description) u0) ERR-INVALID-INPUT)
-    (asserts! (<= (len description) u256) ERR-MILESTONE-DESCRIPTION-TOO-LONG)
-    (asserts! (<= amount-to-release (get total-funding-target mission)) ERR-MILESTONE-AMOUNT-EXCEEDS-MISSION-TARGET)
+    (asserts! (> validated-amount u0) ERR-INVALID-INPUT)
+    (asserts! (> (len validated-description) u0) ERR-INVALID-INPUT)
+    (asserts! (<= (len validated-description) u256) ERR-MILESTONE-DESCRIPTION-TOO-LONG)
+    (asserts! (<= validated-amount (get total-funding-target mission)) ERR-MILESTONE-AMOUNT-EXCEEDS-MISSION-TARGET)
 
     (map-set milestones new-milestone-id {
-        mission-id: mission-id,
-        description: description,
-        amount-to-release: amount-to-release,
+        mission-id: validated-mission-id,
+        description: validated-description,
+        amount-to-release: validated-amount,
         is-achieved: false,
         is-paid: false
     })
@@ -241,13 +247,16 @@
 ;; @returns `(ok true)` if successful, an error otherwise.
 (define-public (approve-milestone (milestone-id uint))
   (let
-    ((milestone (unwrap! (map-get? milestones milestone-id) ERR-INVALID-MILESTONE-ID)))
+    (
+      (milestone (unwrap! (map-get? milestones milestone-id) ERR-INVALID-MILESTONE-ID))
+      (validated-milestone-id milestone-id)
+    )
     (try! (assert-is-committee-member))
     (asserts! (not (get is-achieved milestone)) ERR-MILESTONE-ALREADY-ACHIEVED)
     (asserts! (not (get is-paid milestone)) ERR-MILESTONE-ALREADY-PAID)
-    (asserts! (not (default-to false (map-get? milestone-approvals { milestone-id: milestone-id, approver: tx-sender }))) ERR-ALREADY-APPROVED)
+    (asserts! (not (default-to false (map-get? milestone-approvals { milestone-id: validated-milestone-id, approver: tx-sender }))) ERR-ALREADY-APPROVED)
 
-    (ok (map-set milestone-approvals { milestone-id: milestone-id, approver: tx-sender } true))
+    (ok (map-set milestone-approvals { milestone-id: validated-milestone-id, approver: tx-sender } true))
   ))
 
 ;; @desc Releases funds for a milestone if enough committee approvals are met.
@@ -257,24 +266,26 @@
   (let
     (
       (milestone (unwrap! (map-get? milestones milestone-id) ERR-INVALID-MILESTONE-ID))
-      (mission-id (get mission-id milestone))
-      (mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID))
-      (approvals (get-num-milestone-approvals milestone-id))
+      (validated-milestone-id milestone-id)
+      (validated-mission-id (get mission-id milestone))
+      (mission (unwrap! (map-get? mission-data validated-mission-id) ERR-INVALID-MISSION-ID))
+      (approvals (get-num-milestone-approvals validated-milestone-id))
       (proposer (get proposer mission))
       (amount (get amount-to-release milestone))
       (current-funds (get current-funds-held mission))
+      (new-funds (- current-funds amount))
     )
-    (try! (assert-is-mission-proposer mission-id))
+    (try! (assert-is-mission-proposer validated-mission-id))
     (asserts! (not (is-eq (get status mission) STATUS-CANCELED)) ERR-MISSION-ALREADY-CANCELED)
     (asserts! (not (get is-paid milestone)) ERR-MILESTONE-ALREADY-PAID)
     (asserts! (>= approvals (var-get required-approvals)) ERR-INSUFFICIENT-APPROVERS)
     (asserts! (>= current-funds amount) ERR-INSUFFICIENT-FUNDS)
 
     ;; Mark milestone as achieved and paid
-    (map-set milestones milestone-id (merge milestone { is-achieved: true, is-paid: true }))
+    (map-set milestones validated-milestone-id (merge milestone { is-achieved: true, is-paid: true }))
 
     ;; Update mission's funds held
-    (map-set mission-data mission-id (merge mission { current-funds-held: (- current-funds amount) }))
+    (map-set mission-data validated-mission-id (merge mission { current-funds-held: new-funds }))
 
     ;; Transfer STX to mission proposer
     (try! (as-contract (stx-transfer? amount tx-sender proposer)))
@@ -286,11 +297,14 @@
 ;; @returns `(ok true)` if successful, an error otherwise.
 (define-public (cancel-mission (mission-id uint))
   (let
-    ((mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID)))
+    (
+      (mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID))
+      (validated-mission-id mission-id)
+    )
     (asserts! (or (is-eq tx-sender (var-get contract-owner)) (is-committee-member tx-sender)) ERR-NOT-AUTHORIZED)
     (asserts! (not (is-eq (get status mission) STATUS-CANCELED)) ERR-MISSION-ALREADY-CANCELED)
 
-    (map-set mission-data mission-id (merge mission { status: STATUS-CANCELED }))
+    (map-set mission-data validated-mission-id (merge mission { status: STATUS-CANCELED }))
     (ok true)
   ))
 
@@ -301,30 +315,34 @@
   (let
     (
       (mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID))
+      (validated-mission-id mission-id)
       (funder tx-sender)
-      (contribution (default-to u0 (map-get? funder-contributions { mission-id: mission-id, funder: funder })))
+      (contribution (default-to u0 (map-get? funder-contributions { mission-id: validated-mission-id, funder: funder })))
       (total-target (get total-funding-target mission))
       (current-funds (get current-funds-held mission))
     )
     (asserts! (is-eq (get status mission) STATUS-CANCELED) ERR-MISSION-NOT-CANCELED)
     (asserts! (> contribution u0) ERR-INSUFFICIENT-FUNDS)
-    (asserts! (not (default-to false (map-get? funder-refunds { mission-id: mission-id, funder: funder }))) ERR-REFUND-ALREADY-PROCESSED)
+    (asserts! (not (default-to false (map-get? funder-refunds { mission-id: validated-mission-id, funder: funder }))) ERR-REFUND-ALREADY-PROCESSED)
 
     ;; Calculate proportional refund based on remaining funds
     (let
-      ((refund-amount (if (> current-funds u0)
+      (
+        (refund-amount (if (> current-funds u0)
                          (/ (* contribution current-funds) total-target)
-                         u0)))
+                         u0))
+        (new-funds (- current-funds refund-amount))
+      )
       (asserts! (> refund-amount u0) ERR-INSUFFICIENT-FUNDS)
       
       ;; Mark refund as processed
-      (map-set funder-refunds { mission-id: mission-id, funder: funder } true)
+      (map-set funder-refunds { mission-id: validated-mission-id, funder: funder } true)
       
       ;; Transfer refund
       (try! (as-contract (stx-transfer? refund-amount tx-sender funder)))
       
       ;; Update mission funds
-      (map-set mission-data mission-id (merge mission { current-funds-held: (- current-funds refund-amount) }))
+      (map-set mission-data validated-mission-id (merge mission { current-funds-held: new-funds }))
       
       (ok refund-amount)
     )))
