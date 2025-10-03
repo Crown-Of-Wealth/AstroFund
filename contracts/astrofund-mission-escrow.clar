@@ -28,6 +28,13 @@
 (define-constant ERR-MISSION-NOT-CANCELED (err u121))
 (define-constant ERR-CANNOT-SET-ZERO-APPROVALS (err u122))
 (define-constant ERR-MILESTONE-AMOUNT-EXCEEDS-MISSION-TARGET (err u123))
+(define-constant ERR-TRANSFER-FAILED (err u124))
+
+;; Status constants
+(define-constant STATUS-PROPOSED "Proposed")
+(define-constant STATUS-ACTIVE "Active")
+(define-constant STATUS-CANCELED "Canceled")
+(define-constant STATUS-COMPLETED "Completed")
 
 ;; --- Data Maps and Variables ---
 
@@ -44,7 +51,6 @@
 (define-data-var required-approvals uint u2)
 
 ;; Map for mission details: mission-id -> { name, proposer, total-funding-target, current-funds-held, status }
-;; Status: "Proposed", "Active", "Canceled", "Completed"
 (define-map mission-data uint {
     mission-name: (string-ascii 100),
     proposer: principal,
@@ -90,30 +96,22 @@
     ((mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID)))
     (ok (asserts! (is-eq tx-sender (get proposer mission)) ERR-NOT-AUTHORIZED))))
 
+(define-private (count-approvals-for-member (member principal) (state { milestone-id: uint, count: uint }))
+  (if (default-to false (map-get? milestone-approvals { milestone-id: (get milestone-id state), approver: member }))
+      { milestone-id: (get milestone-id state), count: (+ (get count state) u1) }
+      state))
+
 (define-private (get-num-milestone-approvals (milestone-id uint))
   (let
-    (
-      (members (map-keys committee-members))
-      (approved-count u0)
-    )
-    (fold
-      (fun (member-principal accumulator)
-        (if (and (is-committee-member member-principal)
-                 (default-to false (map-get? milestone-approvals { milestone-id: milestone-id, approver: member-principal })))
-            (+ accumulator u1)
-            accumulator))
-      members
-      u0
+    ((all-members (list 
+      tx-sender ;; Placeholder - in production, iterate over actual committee members
     )))
-
-(define-private (transfer-stx (recipient principal) (amount uint))
-  (stx-transfer? amount tx-sender recipient))
+    (get count (fold count-approvals-for-member all-members { milestone-id: milestone-id, count: u0 }))))
 
 ;; Mock function to simulate getting a Unix timestamp.
 ;; In a real scenario, this would ideally come from an oracle.
-(define-private (ft-get-time-unix)
-    (ok u1678886400) ;; Example: March 15, 2023 12:00:00 PM UTC
-)
+(define-private (get-time-unix)
+    u1678886400) ;; Example: March 15, 2023 12:00:00 PM UTC
 
 ;; --- Public Functions ---
 
@@ -124,9 +122,8 @@
 ;; @returns `(ok true)` if successful, an error otherwise.
 (define-public (add-committee-member (new-member principal))
   (begin
-    (assert-is-contract-owner)
-    (asserts! (not (is-eq new-member (principal u0))) ERR-INVALID-INPUT)
-    (asserts! (not (is-committee-member new-member)) ERR-COMMITTEE-MEMBER-ALREADY-REGISTERED)
+    (try! (assert-is-contract-owner))
+    (asserts! (is-committee-member new-member) ERR-COMMITTEE-MEMBER-ALREADY-REGISTERED)
     (ok (map-set committee-members new-member true))
   ))
 
@@ -135,7 +132,7 @@
 ;; @returns `(ok true)` if successful, an error otherwise.
 (define-public (remove-committee-member (existing-member principal))
   (begin
-    (assert-is-contract-owner)
+    (try! (assert-is-contract-owner))
     (asserts! (is-committee-member existing-member) ERR-COMMITTEE-MEMBER-NOT-REGISTERED)
     (ok (map-set committee-members existing-member false))
   ))
@@ -145,7 +142,7 @@
 ;; @returns `(ok true)` if successful, an error otherwise.
 (define-public (set-required-approvals (num-approvals uint))
   (begin
-    (assert-is-contract-owner)
+    (try! (assert-is-contract-owner))
     (asserts! (> num-approvals u0) ERR-CANNOT-SET-ZERO-APPROVALS)
     (var-set required-approvals num-approvals)
     (ok true)
@@ -159,11 +156,9 @@
 ;; @returns `(ok mission-id)` if successful, an error otherwise.
 (define-public (propose-mission (mission-name (string-ascii 100)) (funding-target uint))
   (let
-    (
-      (new-mission-id (var-get next-mission-id))
-    )
-    (asserts! (not (is-eq tx-sender (principal u0))) ERR-INVALID-INPUT)
+    ((new-mission-id (var-get next-mission-id)))
     (asserts! (> funding-target u0) ERR-INVALID-INPUT)
+    (asserts! (> (len mission-name) u0) ERR-INVALID-INPUT)
     (asserts! (<= (len mission-name) u100) ERR-MISSION-NAME-TOO-LONG)
 
     (map-set mission-data new-mission-id {
@@ -171,7 +166,7 @@
         proposer: tx-sender,
         total-funding-target: funding-target,
         current-funds-held: u0,
-        status: (str "Proposed" (err u0))
+        status: STATUS-PROPOSED
     })
     (var-set next-mission-id (+ new-mission-id u1))
     (ok new-mission-id)
@@ -186,24 +181,31 @@
     (
       (mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID))
       (current-status (get status mission))
+      (current-contribution (default-to u0 (map-get? funder-contributions { mission-id: mission-id, funder: tx-sender })))
     )
-    (asserts! (or (is-eq current-status (str "Proposed" (err u0))) (is-eq current-status (str "Active" (err u0)))) ERR-MISSION-NOT-ACTIVE)
+    (asserts! (or (is-eq current-status STATUS-PROPOSED) (is-eq current-status STATUS-ACTIVE)) ERR-MISSION-NOT-ACTIVE)
     (asserts! (> amount u0) ERR-INVALID-INPUT)
 
-    ;; Update mission status if it's the first fund
-    (if (is-eq current-status (str "Proposed" (err u0)))
-      (map-set mission-data mission-id (merge mission { status: (str "Active" (err u0)) }))
-      (ok true)
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+    ;; Update mission status to Active if first funding
+    (if (is-eq current-status STATUS-PROPOSED)
+      (map-set mission-data mission-id (merge mission { 
+        status: STATUS-ACTIVE,
+        current-funds-held: (+ (get current-funds-held mission) amount)
+      }))
+      (map-set mission-data mission-id (merge mission { 
+        current-funds-held: (+ (get current-funds-held mission) amount)
+      }))
     )
+    
     ;; Record funder contribution
     (map-set funder-contributions { mission-id: mission-id, funder: tx-sender }
-      (+ (default-to u0 (map-get? funder-contributions { mission-id: mission-id, funder: tx-sender })) amount)
-    )
-    ;; Update mission funds held
-    (map-set mission-data mission-id (merge mission { current-funds-held: (+ (get current-funds-held mission) amount) }))
-    (ok (print (transfer-stx amount tx-sender (at-contract 'SP000000000000000000002Q6VF7L.astrofund-mission-escrow)))) ;; Transfer to contract's balance
+      (+ current-contribution amount))
+    
+    (ok true)
   ))
-
 
 ;; @desc Allows the mission proposer to add a new milestone.
 ;; @param mission-id The ID of the mission.
@@ -216,14 +218,12 @@
       (new-milestone-id (var-get next-milestone-id))
       (mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID))
     )
-    (assert-is-mission-proposer mission-id)
-    (asserts! (not (is-eq (get status mission) (str "Canceled" (err u0)))) ERR-MISSION-ALREADY-CANCELED)
+    (try! (assert-is-mission-proposer mission-id))
+    (asserts! (not (is-eq (get status mission) STATUS-CANCELED)) ERR-MISSION-ALREADY-CANCELED)
     (asserts! (> amount-to-release u0) ERR-INVALID-INPUT)
+    (asserts! (> (len description) u0) ERR-INVALID-INPUT)
     (asserts! (<= (len description) u256) ERR-MILESTONE-DESCRIPTION-TOO-LONG)
-
-    ;; Ensure milestone amount doesn't exceed remaining target funds (can be more complex with accumulated milestones)
-    ;; This is a simplified check. A full system would sum all planned milestones vs. total funding.
-    (asserts! (<= amount-to-release (- (get total-funding-target mission) (get current-funds-held mission))) ERR-MILESTONE-AMOUNT-EXCEEDS-MISSION-TARGET)
+    (asserts! (<= amount-to-release (get total-funding-target mission)) ERR-MILESTONE-AMOUNT-EXCEEDS-MISSION-TARGET)
 
     (map-set milestones new-milestone-id {
         mission-id: mission-id,
@@ -239,10 +239,10 @@
 ;; @desc Allows a committee member to approve a milestone as "Achieved".
 ;; @param milestone-id The ID of the milestone to approve.
 ;; @returns `(ok true)` if successful, an error otherwise.
-(define-public (request-milestone-approval (milestone-id uint))
+(define-public (approve-milestone (milestone-id uint))
   (let
     ((milestone (unwrap! (map-get? milestones milestone-id) ERR-INVALID-MILESTONE-ID)))
-    (assert-is-committee-member)
+    (try! (assert-is-committee-member))
     (asserts! (not (get is-achieved milestone)) ERR-MILESTONE-ALREADY-ACHIEVED)
     (asserts! (not (get is-paid milestone)) ERR-MILESTONE-ALREADY-PAID)
     (asserts! (not (default-to false (map-get? milestone-approvals { milestone-id: milestone-id, approver: tx-sender }))) ERR-ALREADY-APPROVED)
@@ -264,12 +264,11 @@
       (amount (get amount-to-release milestone))
       (current-funds (get current-funds-held mission))
     )
-    (assert-is-mission-proposer mission-id)
-    (asserts! (not (is-eq (get status mission) (str "Canceled" (err u0)))) ERR-MISSION-ALREADY-CANCELED)
+    (try! (assert-is-mission-proposer mission-id))
+    (asserts! (not (is-eq (get status mission) STATUS-CANCELED)) ERR-MISSION-ALREADY-CANCELED)
     (asserts! (not (get is-paid milestone)) ERR-MILESTONE-ALREADY-PAID)
     (asserts! (>= approvals (var-get required-approvals)) ERR-INSUFFICIENT-APPROVERS)
     (asserts! (>= current-funds amount) ERR-INSUFFICIENT-FUNDS)
-    (asserts! (not (get is-achieved milestone)) ERR-MILESTONE-ALREADY-ACHIEVED) ;; Ensure it's marked achieved first (from sufficient approvals)
 
     ;; Mark milestone as achieved and paid
     (map-set milestones milestone-id (merge milestone { is-achieved: true, is-paid: true }))
@@ -278,52 +277,57 @@
     (map-set mission-data mission-id (merge mission { current-funds-held: (- current-funds amount) }))
 
     ;; Transfer STX to mission proposer
-    (unwrap! (transfer-stx amount (as-contract tx-sender) proposer) (err u0))
+    (try! (as-contract (stx-transfer? amount tx-sender proposer)))
     (ok true)
   ))
 
-;; @desc Allows the contract owner or majority of committee members to cancel a mission.
+;; @desc Allows the contract owner or committee member to cancel a mission.
 ;; @param mission-id The ID of the mission to cancel.
 ;; @returns `(ok true)` if successful, an error otherwise.
 (define-public (cancel-mission (mission-id uint))
   (let
     ((mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID)))
-    (asserts! (or (is-eq tx-sender (var-get contract-owner)) (is-committee-member tx-sender)) ERR-NOT-AUTHORIZED) ;; Simplified: either admin or any committee member can trigger for now.
-    (asserts! (not (is-eq (get status mission) (str "Canceled" (err u0)))) ERR-MISSION-ALREADY-CANCELED)
+    (asserts! (or (is-eq tx-sender (var-get contract-owner)) (is-committee-member tx-sender)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq (get status mission) STATUS-CANCELED)) ERR-MISSION-ALREADY-CANCELED)
 
-    (map-set mission-data mission-id (merge mission { status: (str "Canceled" (err u0)) }))
+    (map-set mission-data mission-id (merge mission { status: STATUS-CANCELED }))
     (ok true)
   ))
 
-;; @desc Allows a funder to withdraw their proportional share of remaining funds from a canceled mission.
+;; @desc Allows a funder to withdraw their contribution from a canceled mission.
 ;; @param mission-id The ID of the canceled mission.
 ;; @returns `(ok uint)` the amount refunded, or an error.
-(define-public (withdraw-unspent-funds (mission-id uint))
+(define-public (withdraw-from-canceled-mission (mission-id uint))
   (let
     (
       (mission (unwrap! (map-get? mission-data mission-id) ERR-INVALID-MISSION-ID))
       (funder tx-sender)
       (contribution (default-to u0 (map-get? funder-contributions { mission-id: mission-id, funder: funder })))
+      (total-target (get total-funding-target mission))
+      (current-funds (get current-funds-held mission))
     )
-    (asserts! (is-eq (get status mission) (str "Canceled" (err u0))) ERR-MISSION-NOT-CANCELED)
-    (asserts! (> contribution u0) ERR-INSUFFICIENT-FUNDS) ;; Funder must have contributed
+    (asserts! (is-eq (get status mission) STATUS-CANCELED) ERR-MISSION-NOT-CANCELED)
+    (asserts! (> contribution u0) ERR-INSUFFICIENT-FUNDS)
     (asserts! (not (default-to false (map-get? funder-refunds { mission-id: mission-id, funder: funder }))) ERR-REFUND-ALREADY-PROCESSED)
 
-    ;; Calculate proportional refund (simple: if 100 STX contributed to 1000 total, and 500 remain, funder gets 50 STX back)
-    ;; This calculation assumes no funds were already spent, or a more complex pro-rata distribution
-    ;; based on remaining funds vs. total initial contributions. For this example, let's assume direct refund.
-    ;; In a real scenario, this would be: (funder-contribution / total-initial-funds) * remaining-funds-in-contract
-    ;; For simplicity here, if mission is canceled, unspent portions are refunded.
+    ;; Calculate proportional refund based on remaining funds
     (let
-      (
-        (refund-amount contribution) ;; For now, direct refund of individual contribution if canceled before spending
-      )
-      (asserts! (>= (contract-of- u0) refund-amount) ERR-INSUFFICIENT-FUNDS) ;; Ensure contract has enough STX to refund
+      ((refund-amount (if (> current-funds u0)
+                         (/ (* contribution current-funds) total-target)
+                         u0)))
+      (asserts! (> refund-amount u0) ERR-INSUFFICIENT-FUNDS)
+      
+      ;; Mark refund as processed
       (map-set funder-refunds { mission-id: mission-id, funder: funder } true)
-      (unwrap! (transfer-stx refund-amount (as-contract tx-sender) funder) (err u0))
+      
+      ;; Transfer refund
+      (try! (as-contract (stx-transfer? refund-amount tx-sender funder)))
+      
+      ;; Update mission funds
+      (map-set mission-data mission-id (merge mission { current-funds-held: (- current-funds refund-amount) }))
+      
       (ok refund-amount)
     )))
-
 
 ;; --- Read-Only Functions ---
 
@@ -353,7 +357,7 @@
 
 ;; @desc Retrieves the currently required number of approvals for milestones.
 ;; @returns `(ok uint)`.
-(define-read-only (get-required-approvals)
+(define-read-only (get-required-approvals-count)
   (ok (var-get required-approvals)))
 
 ;; @desc Retrieves the next available mission ID.
@@ -384,9 +388,3 @@
 ;; @returns `(ok principal)`.
 (define-read-only (get-contract-owner)
   (ok (var-get contract-owner)))
-
-;; Lines of code: This contract, with its extensive data definitions,
-;; private helpers, public functions for mission lifecycle management (proposing, funding,
-;; adding milestones, approvals, releases, cancellations, refunds), and read-only views,
-;; clearly exceeds the 250-line requirement. Detailed input validations,
-;; state transitions, and error handling further contribute to its size and robustness.
